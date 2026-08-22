@@ -1,4 +1,4 @@
-package udpr
+package usecase
 
 import (
 	"context"
@@ -6,26 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log"
-	mrand "math/rand"
-	"net"
 	"sync"
 	"time"
+
+	"github.com/argus/udpr/internal/domain"
+	"github.com/argus/udpr/internal/port"
 )
-
-// SessionInfo описывает поток, для которого запрашивается приёмник данных.
-type SessionInfo struct {
-	Session uint32
-	Peer    *net.UDPAddr
-	Started time.Time
-}
-
-func (i SessionInfo) String() string {
-	return fmt.Sprintf("%08x от %s", i.Session, i.Peer)
-}
-
-// SinkFactory выдаёт приёмник данных под новую сессию. Возвращённый
-// io.WriteCloser закрывается при завершении сессии.
-type SinkFactory func(SessionInfo) (io.WriteCloser, error)
 
 // ServerConfig — параметры постоянно работающего приёмника.
 type ServerConfig struct {
@@ -37,11 +23,10 @@ type ServerConfig struct {
 	// SingleSession принимает ровно один поток и отбрасывает всё остальное —
 	// режим одноразового приёма (команда recv).
 	SingleSession bool
-	Loss          float64 // имитация потерь обратного канала, 0..1
 	Verbose       bool
 
 	// OnSessionEnd вызывается при завершении или выселении сессии.
-	OnSessionEnd func(SessionInfo, ReceiverStats, bool)
+	OnSessionEnd func(port.SessionInfo, ReceiverStats, bool)
 }
 
 // DefaultServerConfig — значения по умолчанию для постоянного приёма.
@@ -56,8 +41,8 @@ func DefaultServerConfig() ServerConfig {
 }
 
 func (c *ServerConfig) normalize() {
-	if c.Window <= 0 || c.Window > BitmapBits {
-		c.Window = BitmapBits
+	if c.Window <= 0 || c.Window > domain.BitmapBits {
+		c.Window = domain.BitmapBits
 	}
 	if c.AckEvery <= 0 {
 		c.AckEvery = c.Window / 4
@@ -76,24 +61,6 @@ func (c *ServerConfig) normalize() {
 	}
 }
 
-// Server — постоянно слушающий приёмник UDPR. Обслуживает несколько сессий
-// одновременно, переживает завершение и переустановку потоков и не выходит
-// сам: работает, пока не отменён контекст.
-type Server struct {
-	cfg     ServerConfig
-	conn    *net.UDPConn
-	factory SinkFactory
-	rng     *mrand.Rand
-
-	sessions map[sessionKey]*session
-	sinks    map[sessionKey]io.Closer
-
-	// счётчики читаются снаружи (мониторинг, тесты), поэтому под мьютексом;
-	// сами сессии живут в одной горутине Serve и блокировки не требуют
-	mu    sync.Mutex
-	total Totals
-}
-
 // Totals — сводные счётчики сервера за всё время работы.
 type Totals struct {
 	Sessions  uint64
@@ -108,37 +75,45 @@ func (t Totals) String() string {
 		t.Sessions, t.Completed, t.Evicted, t.Rejected, t.Bytes)
 }
 
-// NewServer открывает сокет и готовит постоянный приём.
-func NewServer(bind string, cfg ServerConfig, factory SinkFactory) (*Server, error) {
-	addr, err := net.ResolveUDPAddr("udp", bind)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return NewServerConn(conn, cfg, factory), nil
+// Server — постоянно слушающий приёмник UDPR. Обслуживает несколько сессий
+// одновременно, переживает завершение и переустановку потоков и не выходит
+// сам: работает, пока не отменён контекст.
+//
+// Знает только port.Link и port.Clock: ни UDP, ни файлов, ни системных часов
+// в этом слое нет.
+type Server struct {
+	cfg     ServerConfig
+	link    port.Link
+	clock   port.Clock
+	factory port.SinkFactory
+
+	sessions map[sessionKey]*session
+	sinks    map[sessionKey]io.Closer
+
+	// счётчики читаются снаружи (мониторинг, тесты), поэтому под мьютексом;
+	// сами сессии живут в одной горутине Serve и блокировки не требуют
+	mu    sync.Mutex
+	total Totals
 }
 
-// NewServerConn собирает сервер поверх готового сокета (для тестов).
-func NewServerConn(conn *net.UDPConn, cfg ServerConfig, factory SinkFactory) *Server {
+// NewServer собирает приёмник поверх канала, часов и фабрики приёмников данных.
+func NewServer(link port.Link, clock port.Clock, cfg ServerConfig, factory port.SinkFactory) *Server {
 	cfg.normalize()
 	return &Server{
 		cfg:      cfg,
-		conn:     conn,
+		link:     link,
+		clock:    clock,
 		factory:  factory,
-		rng:      mrand.New(mrand.NewSource(time.Now().UnixNano())),
 		sessions: make(map[sessionKey]*session),
 		sinks:    make(map[sessionKey]io.Closer),
 	}
 }
 
-// Close закрывает сокет.
-func (s *Server) Close() error { return s.conn.Close() }
+// Close закрывает канал.
+func (s *Server) Close() error { return s.link.Close() }
 
 // LocalAddr возвращает адрес прослушивания.
-func (s *Server) LocalAddr() net.Addr { return s.conn.LocalAddr() }
+func (s *Server) LocalAddr() port.Addr { return s.link.LocalAddr() }
 
 // Totals возвращает сводные счётчики. Безопасно вызывать из другой горутины.
 func (s *Server) Totals() Totals {
@@ -160,15 +135,12 @@ func (s *Server) logf(format string, a ...any) {
 	}
 }
 
-func (s *Server) sendPacket(p *Packet, dst *net.UDPAddr) {
-	if s.cfg.Loss > 0 && s.rng.Float64() < s.cfg.Loss {
-		return
-	}
+func (s *Server) sendPacket(p *domain.Packet, dst port.Addr) {
 	wire, err := p.Encode()
 	if err != nil {
 		return
 	}
-	if _, err := s.conn.WriteToUDP(wire, dst); err != nil {
+	if err := s.link.Send(wire, dst); err != nil {
 		s.logf("ошибка отправки ACK: %v", err)
 	}
 }
@@ -177,7 +149,6 @@ func (s *Server) sendPacket(p *Packet, dst *net.UDPAddr) {
 // остановку по контексту.
 func (s *Server) Serve(ctx context.Context) error {
 	defer s.closeAll()
-	buf := make([]byte, 65535)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -189,42 +160,40 @@ func (s *Server) Serve(ctx context.Context) error {
 		if s.hasPendingAcks() {
 			wait = s.cfg.AckDelay
 		}
-		_ = s.conn.SetReadDeadline(time.Now().Add(wait))
 
-		n, src, err := s.conn.ReadFromUDP(buf)
-		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				s.flushAcks()
-				s.evictIdle()
-				continue
-			}
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
+		dg, err := s.link.Recv(wait)
+		switch {
+		case err == nil:
+		case port.IsTimeout(err):
+			s.flushAcks()
+			s.evictIdle()
+			continue
+		case ctx.Err() != nil || errors.Is(err, port.ErrClosed):
+			return nil
+		default:
 			return err
 		}
 
-		p, decErr := Decode(buf[:n])
+		p, decErr := domain.Decode(dg.Payload)
 		if decErr != nil {
 			s.bump(func(t *Totals) { t.Rejected++ })
-			s.logf("отброшен пакет от %s: %v", src, decErr)
+			s.logf("отброшен пакет от %s: %v", dg.Peer, decErr)
 			continue
 		}
-		if err := s.dispatch(p, src); err != nil {
+		if err := s.dispatch(p, dg.Peer); err != nil {
 			s.logf("сессия %08x: %v", p.Session, err)
 		}
 		s.evictIdle()
 	}
 }
 
-func (s *Server) dispatch(p *Packet, src *net.UDPAddr) error {
+func (s *Server) dispatch(p *domain.Packet, src port.Addr) error {
 	key := sessionKey{peer: src.String(), id: p.Session}
 	sess, ok := s.sessions[key]
 	if !ok {
 		// новую сессию открывают только HELLO и DATA; ACK и FIN от неизвестного
 		// потока — это мусор или повтор уже закрытой сессии
-		if p.Type != TypeHello && p.Type != TypeData {
+		if p.Type != domain.TypeHello && p.Type != domain.TypeData {
 			s.bump(func(t *Totals) { t.Rejected++ })
 			return nil
 		}
@@ -237,13 +206,13 @@ func (s *Server) dispatch(p *Packet, src *net.UDPAddr) error {
 			return fmt.Errorf("достигнут предел сессий (%d), поток от %s отклонён",
 				s.cfg.MaxSessions, src)
 		}
-		info := SessionInfo{Session: p.Session, Peer: src, Started: time.Now()}
+		info := port.SessionInfo{Session: p.Session, Peer: src, Started: s.clock.Now()}
 		sink, err := s.factory(info)
 		if err != nil {
 			s.bump(func(t *Totals) { t.Rejected++ })
 			return fmt.Errorf("не удалось открыть приёмник: %w", err)
 		}
-		sess = newSession(p.Session, src, sink, s.cfg, s.sendPacket)
+		sess = newSession(p.Session, src, sink, s.cfg, s.clock, s.sendPacket)
 		s.sessions[key] = sess
 		s.sinks[key] = sink
 		s.bump(func(t *Totals) { t.Sessions++ })
@@ -278,7 +247,7 @@ func (s *Server) finish(key sessionKey, sess *session, completed bool) {
 	s.logf("сессия %08x завершена (%s), %s", sess.id,
 		map[bool]string{true: "поток закрыт", false: "прервана"}[completed], sess.stats)
 	if s.cfg.OnSessionEnd != nil {
-		s.cfg.OnSessionEnd(SessionInfo{Session: sess.id, Peer: sess.peer, Started: sess.started},
+		s.cfg.OnSessionEnd(port.SessionInfo{Session: sess.id, Peer: sess.peer, Started: sess.started},
 			sess.stats, completed)
 	}
 }
@@ -301,8 +270,9 @@ func (s *Server) flushAcks() {
 // evictIdle закрывает сессии, замолчавшие дольше SessionIdle. Незавершённый
 // поток — это потеря данных, поэтому такие сессии считаются отдельно.
 func (s *Server) evictIdle() {
+	now := s.clock.Now()
 	for key, sess := range s.sessions {
-		if time.Since(sess.lastSeen) > s.cfg.SessionIdle {
+		if now.Sub(sess.lastSeen) > s.cfg.SessionIdle {
 			s.logf("сессия %08x выселена по таймауту, доставлено %d байт (не завершена)",
 				sess.id, sess.stats.Bytes)
 			s.finish(key, sess, false)

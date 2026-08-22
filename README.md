@@ -118,7 +118,7 @@ go test ./... -race
 
 ## ACK Guard — контроль обратного канала
 
-Обратный канал управляемый, а не свободный (слайд 15). `internal/udpr/ackguard.go`
+Обратный канал управляемый, а не свободный (слайд 15). `internal/domain/ackguard.go`
 отклоняет всё, что не является строго детерминированной служебной структурой:
 
 * не-ACK пакет в обратном канале;
@@ -165,15 +165,46 @@ Loopback, один поток, обычные сокеты ядра (Go), `-rto 
 
 ## Структура
 
+Слои чистой архитектуры, зависимости направлены только внутрь: `domain` не знает
+никого, `usecase` знает `domain` и `port`, `adapter` реализует `port`, и лишь
+`app` знает всех — там разбирается командная строка и собирается граф
+зависимостей. В `main` не остаётся ничего, кроме вызова `app.Run`.
+
 ```
-cmd/udpr/main.go          CLI: send / recv / serve / selftest
-internal/udpr/packet.go   формат и разбор пакета, CRC
-internal/udpr/sender.go   окно, буфер до ACK, таймеры, retransmit
-internal/udpr/server.go   постоянный приём, таблица сессий, выселение
-internal/udpr/session.go  контроль seq, reorder-буфер, политика ACK
-internal/udpr/receiver.go одноразовый приём (обёртка над Server)
-internal/udpr/ackguard.go ограничение обратного канала
+internal/domain/       ядро протокола: без сети, файлов и системных часов
+  packet.go            формат и разбор пакета, CRC
+  window.go            окно отправителя, таймауты, fast retransmit
+  reassembly.go        контроль seq, reorder-буфер, ACK bitmap
+  ackguard.go          политика обратного канала
+
+internal/port/         границы наружу: Link, Clock, SinkFactory
+  port.go
+
+internal/usecase/      сценарии поверх домена и портов
+  sender.go            передача потока: очередь, ACK, повторы
+  server.go            постоянный приём, таблица сессий, выселение
+  session.go           политика ACK для одной сессии
+  receiver.go          одноразовый приём (обёртка над Server)
+
+internal/adapter/      реализации портов
+  udplink/             port.Link поверх UDP-сокета
+  lossylink/           обёртка Link с имитацией потерь (для тестов и -loss)
+  sysclock/            port.Clock поверх системных часов
+  filesink/            port.SinkFactory: сессия -> файл в каталоге
+
+internal/app/          точка сборки: CLI и связывание адаптеров со сценариями
+  app.go               Run: разбор команды, коды возврата, usage
+  wire.go              создание адаптеров под сценарий
+  send.go recv.go serve.go selftest.go   флаги и запуск команд
+  io.go                stdin/stdout, файлы, предупреждения
+
+cmd/udpr/main.go       только os.Exit(app.Run(os.Args[1:]))
 ```
+
+Практический смысл границ: смена инкапсуляции (свой IP-протокол, L2 поверх
+прямого линка) — это новая реализация `port.Link`, а не правка протокола;
+другое назначение потока (очередь, форвардер в SIEM вместо файла) — новая
+реализация `port.SinkFactory`. Логика доставки в обоих случаях не меняется.
 
 ## Сессии и отказы
 

@@ -1,4 +1,4 @@
-package udpr
+package domain
 
 import (
 	"fmt"
@@ -29,13 +29,13 @@ func NewAckGuard(session uint32, rateLimit, burst float64) *AckGuard {
 		RateLimit: rateLimit,
 		Burst:     burst,
 		tokens:    burst,
-		last:      time.Now(),
 	}
 }
 
 // Check проверяет ACK против политики. Допустимый диапазон ack_base —
-// [expectLo, expectHi] включительно.
-func (g *AckGuard) Check(p *Packet, expectLo, expectHi uint32) bool {
+// [expectLo, expectHi] включительно. Текущее время передаётся параметром,
+// чтобы слой оставался независимым от системных часов.
+func (g *AckGuard) Check(p *Packet, expectLo, expectHi uint32, now time.Time) bool {
 	switch {
 	case p.Type != TypeAck:
 		return g.reject("не ACK в обратном канале: " + TypeName(p.Type))
@@ -51,7 +51,9 @@ func (g *AckGuard) Check(p *Packet, expectLo, expectHi uint32) bool {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	now := time.Now()
+	if g.last.IsZero() {
+		g.last = now
+	}
 	g.tokens += now.Sub(g.last).Seconds() * g.RateLimit
 	if g.tokens > g.Burst {
 		g.tokens = g.Burst

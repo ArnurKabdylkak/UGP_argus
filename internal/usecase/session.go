@@ -1,10 +1,28 @@
-package udpr
+package usecase
 
 import (
+	"fmt"
 	"io"
-	"net"
 	"time"
+
+	"github.com/argus/udpr/internal/domain"
+	"github.com/argus/udpr/internal/port"
 )
+
+// ReceiverStats — счётчики по итогам приёма одного потока.
+type ReceiverStats struct {
+	Received   uint64
+	Dup        uint64
+	OutOfOrder uint64
+	Rejected   uint64
+	Acks       uint64
+	Bytes      uint64
+}
+
+func (s ReceiverStats) String() string {
+	return fmt.Sprintf("received=%d dup=%d out_of_order=%d rejected=%d acks=%d bytes=%d",
+		s.Received, s.Dup, s.OutOfOrder, s.Rejected, s.Acks, s.Bytes)
+}
 
 // sessionKey различает потоки: один и тот же session_id от разных источников —
 // это разные сессии.
@@ -13,14 +31,14 @@ type sessionKey struct {
 	id   uint32
 }
 
-// session — состояние приёма одного потока UDPR.
+// session — состояние приёма одного потока UDPR. Порядок и сборка потока
+// живут в domain.Reassembler; здесь остаются политика ACK и учёт времени.
 type session struct {
 	id   uint32
-	peer *net.UDPAddr
+	peer port.Addr
 	sink io.Writer
 
-	expected uint32 // первый ещё не полученный seq
-	buffer   map[uint32][]byte
+	asm      *domain.Reassembler
 	finSeq   uint32
 	haveFin  bool
 	complete bool
@@ -35,18 +53,19 @@ type session struct {
 	window   int
 	ackEvery int
 	ackDelay time.Duration
-	send     func(*Packet, *net.UDPAddr)
+	clock    port.Clock
+	send     func(*domain.Packet, port.Addr)
 }
 
-func newSession(id uint32, peer *net.UDPAddr, sink io.Writer, cfg ServerConfig,
-	send func(*Packet, *net.UDPAddr)) *session {
-	now := time.Now()
+func newSession(id uint32, peer port.Addr, sink io.Writer, cfg ServerConfig,
+	clock port.Clock, send func(*domain.Packet, port.Addr)) *session {
+	now := clock.Now()
 	return &session{
 		id: id, peer: peer, sink: sink,
-		buffer:   make(map[uint32][]byte),
+		asm:      domain.NewReassembler(),
 		lastSeen: now, started: now, lastAck: now,
 		window: cfg.Window, ackEvery: cfg.AckEvery, ackDelay: cfg.AckDelay,
-		send: send,
+		clock: clock, send: send,
 	}
 }
 
@@ -54,14 +73,14 @@ func newSession(id uint32, peer *net.UDPAddr, sink io.Writer, cfg ServerConfig,
 func (s *session) sendAck() {
 	s.sinceAck = 0
 	s.ackPending = false
-	s.lastAck = time.Now()
+	s.lastAck = s.clock.Now()
 	s.stats.Acks++
-	s.send(&Packet{
-		Type:      TypeAck,
+	s.send(&domain.Packet{
+		Type:      domain.TypeAck,
 		Session:   s.id,
 		Window:    uint16(s.window),
-		AckBase:   s.expected,
-		AckBitmap: s.bitmap(),
+		AckBase:   s.asm.Expected(),
+		AckBitmap: s.asm.Bitmap(),
 	}, s.peer)
 }
 
@@ -73,7 +92,7 @@ func (s *session) sendAck() {
 func (s *session) scheduleAck(gap bool) {
 	s.sinceAck++
 	s.ackPending = true
-	if gap || s.sinceAck >= s.ackEvery || time.Since(s.lastAck) >= s.ackDelay {
+	if gap || s.sinceAck >= s.ackEvery || s.clock.Now().Sub(s.lastAck) >= s.ackDelay {
 		s.sendAck()
 	}
 }
@@ -85,33 +104,23 @@ func (s *session) flushAck() {
 	}
 }
 
-func (s *session) bitmap() uint32 {
-	var bm uint32
-	for i := 0; i < BitmapBits; i++ {
-		if _, ok := s.buffer[s.expected+1+uint32(i)]; ok {
-			bm |= 1 << uint(i)
-		}
-	}
-	return bm
-}
-
 // handle обрабатывает один пакет сессии. Возвращает true, когда поток завершён.
-func (s *session) handle(p *Packet) (bool, error) {
-	s.lastSeen = time.Now()
+func (s *session) handle(p *domain.Packet) (bool, error) {
+	s.lastSeen = s.clock.Now()
 	switch p.Type {
-	case TypeHello:
+	case domain.TypeHello:
 		s.sendAck()
-	case TypeData:
+	case domain.TypeData:
 		if err := s.onData(p); err != nil {
 			return false, err
 		}
-	case TypeFin:
+	case domain.TypeFin:
 		s.finSeq, s.haveFin = p.Seq, true
 		s.sendAck()
 	default: // ACK в прямом канале — не наш случай
 		s.stats.Rejected++
 	}
-	if s.haveFin && s.expected >= s.finSeq {
+	if s.haveFin && s.asm.Expected() >= s.finSeq {
 		s.flushAck()
 		s.complete = true
 		return true, nil
@@ -119,43 +128,28 @@ func (s *session) handle(p *Packet) (bool, error) {
 	return false, nil
 }
 
-func (s *session) onData(p *Packet) error {
-	_, dup := s.buffer[p.Seq]
-	switch {
-	case p.Seq < s.expected || dup:
+func (s *session) onData(p *domain.Packet) error {
+	switch s.asm.Accept(p.Seq, p.Payload) {
+	case domain.Duplicate:
 		// дубликат: подтверждаем немедленно, отправитель явно не видел наш ACK
 		s.stats.Dup++
 		s.sendAck()
-	case p.Seq >= s.expected+1+BitmapBits:
+	case domain.OutOfWindow:
 		// вне окна приёма: не подтверждаем, отправитель повторит позже
 		s.stats.Rejected++
-	default:
-		if p.Seq != s.expected {
+	case domain.Accepted:
+		if !s.asm.InOrder(p.Seq) {
 			s.stats.OutOfOrder++
 		}
-		s.buffer[p.Seq] = p.Payload
 		s.stats.Received++
 		s.stats.Bytes += uint64(len(p.Payload))
-		if err := s.deliver(); err != nil {
-			return err
+		for _, chunk := range s.asm.Drain() {
+			if _, err := s.sink.Write(chunk); err != nil {
+				return err
+			}
 		}
 		// дырка в потоке — подтверждаем сразу, чтобы отправитель увидел её
-		s.scheduleAck(len(s.buffer) > 0)
+		s.scheduleAck(s.asm.HasGap())
 	}
 	return nil
-}
-
-// deliver отдаёт наверх непрерывный префикс потока.
-func (s *session) deliver() error {
-	for {
-		data, ok := s.buffer[s.expected]
-		if !ok {
-			return nil
-		}
-		delete(s.buffer, s.expected)
-		if _, err := s.sink.Write(data); err != nil {
-			return err
-		}
-		s.expected++
-	}
 }

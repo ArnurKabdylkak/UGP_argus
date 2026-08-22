@@ -1,8 +1,7 @@
-package udpr
+package usecase
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"math/rand"
 	"net"
@@ -10,19 +9,43 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/argus/udpr/internal/adapter/lossylink"
+	"github.com/argus/udpr/internal/adapter/sysclock"
+	"github.com/argus/udpr/internal/adapter/udplink"
+	"github.com/argus/udpr/internal/domain"
+	"github.com/argus/udpr/internal/port"
 )
+
+// listen открывает канал приёма на свободном порту loopback.
+func listen(t *testing.T, loss float64) port.Link {
+	t.Helper()
+	link, err := udplink.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+	return lossylink.Wrap(link, loss)
+}
+
+// dial открывает канал в сторону remote; local закрепляет исходящий порт.
+func dial(t *testing.T, remote, local string, loss float64) port.Link {
+	t.Helper()
+	link, err := udplink.Dial(remote, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+	return lossylink.Wrap(link, loss)
+}
 
 // runTransfer гоняет size байт через loopback при заданных потерях канала.
 func runTransfer(t *testing.T, size int, loss float64) {
 	t.Helper()
 
 	rcfg := DefaultReceiverConfig()
-	rcfg.Loss, rcfg.IdleTimeout = loss, 5*time.Second
-	r, err := NewReceiver("127.0.0.1:0", rcfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
+	rcfg.IdleTimeout = 5 * time.Second
+	r := NewReceiver(listen(t, loss), sysclock.New(), rcfg)
 
 	var sink bytes.Buffer
 	done := make(chan error, 1)
@@ -32,12 +55,8 @@ func runTransfer(t *testing.T, size int, loss float64) {
 	}()
 
 	scfg := DefaultSenderConfig()
-	scfg.Loss, scfg.RTO = loss, 80*time.Millisecond
-	s, err := NewSender(r.LocalAddr().String(), scfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	scfg.RTO = 80 * time.Millisecond
+	s := NewSender(dial(t, r.LocalAddr().String(), "", loss), sysclock.New(), scfg)
 
 	payload := make([]byte, size)
 	rand.New(rand.NewSource(1)).Read(payload)
@@ -68,27 +87,19 @@ func TestDeliverySmallMTU(t *testing.T)     { runTransfer(t, 8*1024, 0.1) }
 
 // Приёмник должен игнорировать трафик чужой сессии.
 func TestReceiverRejectsForeignSession(t *testing.T) {
-	r, err := NewReceiver("127.0.0.1:0", ReceiverConfig{IdleTimeout: 300 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
+	r := NewReceiver(listen(t, 0), sysclock.New(), ReceiverConfig{IdleTimeout: 300 * time.Millisecond})
 
 	var sink bytes.Buffer
 	done := make(chan struct{})
 	go func() { r.ReceiveStream(&sink); close(done) }()
 
-	s, err := NewSender(r.LocalAddr().String(), SenderConfig{Session: 111})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	link := dial(t, r.LocalAddr().String(), "", 0)
 
 	// первый пакет задаёт сессию, второй приходит с чужим session_id
-	own, _ := (&Packet{Type: TypeData, Session: 111, Seq: 0, Payload: []byte("ok")}).Encode()
-	alien, _ := (&Packet{Type: TypeData, Session: 222, Seq: 1, Payload: []byte("bad")}).Encode()
-	s.conn.Write(own)
-	s.conn.Write(alien)
+	own, _ := (&domain.Packet{Type: domain.TypeData, Session: 111, Seq: 0, Payload: []byte("ok")}).Encode()
+	alien, _ := (&domain.Packet{Type: domain.TypeData, Session: 222, Seq: 1, Payload: []byte("bad")}).Encode()
+	link.Send(own, nil)
+	link.Send(alien, nil)
 
 	<-done
 	if got := sink.String(); got != "ok" {
@@ -108,27 +119,17 @@ func TestSenderFixedLocalPort(t *testing.T) {
 	c := newCollector()
 	cfg := DefaultServerConfig()
 	seen := make(chan string, 8)
-	cfg.OnSessionEnd = func(info SessionInfo, _ ReceiverStats, _ bool) {
+	cfg.OnSessionEnd = func(info port.SessionInfo, _ ReceiverStats, _ bool) {
 		seen <- info.Peer.String()
 	}
-	srv, err := NewServer("127.0.0.1:0", cfg, c.factory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.Serve(ctx)
+	srv, stop := startServer(t, cfg, c, 0)
+	defer stop()
 
 	scfg := DefaultSenderConfig()
-	scfg.RTO, scfg.LocalAddr = 40*time.Millisecond, "127.0.0.1:"+strconv.Itoa(localPort)
-	s, err := NewSender(srv.LocalAddr().String(), scfg)
-	if err != nil {
-		t.Fatalf("не удалось занять локальный порт: %v", err)
-	}
-	defer s.Close()
-
+	scfg.RTO = 40 * time.Millisecond
 	want := "127.0.0.1:" + strconv.Itoa(localPort)
+	s := NewSender(dial(t, srv.LocalAddr().String(), want, 0), sysclock.New(), scfg)
+
 	if got := s.LocalAddr().String(); got != want {
 		t.Fatalf("сокет привязан к %s, ожидалось %s", got, want)
 	}
@@ -154,11 +155,9 @@ func TestSenderLocalPortBusy(t *testing.T) {
 	}
 	defer busy.Close()
 
-	cfg := DefaultSenderConfig()
-	cfg.LocalAddr = busy.LocalAddr().String()
-	s, err := NewSender("127.0.0.1:9", cfg)
+	link, err := udplink.Dial("127.0.0.1:9", busy.LocalAddr().String())
 	if err == nil {
-		s.Close()
+		link.Close()
 		t.Fatal("ожидалась ошибка занятого порта, сокет открылся")
 	}
 	if !strings.Contains(err.Error(), "локальный порт") {

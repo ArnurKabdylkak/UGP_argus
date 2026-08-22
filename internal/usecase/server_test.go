@@ -1,4 +1,4 @@
-package udpr
+package usecase
 
 import (
 	"bytes"
@@ -9,6 +9,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/argus/udpr/internal/adapter/sysclock"
+	"github.com/argus/udpr/internal/domain"
+	"github.com/argus/udpr/internal/port"
 )
 
 // collector собирает потоки всех сессий сервера.
@@ -22,7 +26,7 @@ func newCollector() *collector {
 	return &collector{streams: map[uint32]*bytes.Buffer{}}
 }
 
-func (c *collector) factory(info SessionInfo) (io.WriteCloser, error) {
+func (c *collector) factory(info port.SessionInfo) (io.WriteCloser, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	buf := &bytes.Buffer{}
@@ -30,7 +34,7 @@ func (c *collector) factory(info SessionInfo) (io.WriteCloser, error) {
 	return nopCloser{buf}, nil
 }
 
-func (c *collector) onEnd(SessionInfo, ReceiverStats, bool) {
+func (c *collector) onEnd(port.SessionInfo, ReceiverStats, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ended++
@@ -51,31 +55,32 @@ func (c *collector) endedCount() int {
 	return c.ended
 }
 
-func startServer(t *testing.T, cfg ServerConfig, c *collector) (*Server, context.CancelFunc) {
+// startServer поднимает сервер на loopback. Собственный OnSessionEnd теста
+// сохраняется — счётчик коллектора довешивается к нему.
+func startServer(t *testing.T, cfg ServerConfig, c *collector, loss float64) (*Server, context.CancelFunc) {
 	t.Helper()
-	cfg.OnSessionEnd = c.onEnd
-	srv, err := NewServer("127.0.0.1:0", cfg, c.factory)
-	if err != nil {
-		t.Fatal(err)
+	prev := cfg.OnSessionEnd
+	cfg.OnSessionEnd = func(info port.SessionInfo, st ReceiverStats, ok bool) {
+		if prev != nil {
+			prev(info, st, ok)
+		}
+		c.onEnd(info, st, ok)
 	}
+	srv := NewServer(listen(t, loss), sysclock.New(), cfg, c.factory)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		if err := srv.Serve(ctx); err != nil {
 			t.Errorf("Serve вернул ошибку: %v", err)
 		}
 	}()
-	return srv, func() { cancel(); srv.Close() }
+	return srv, cancel
 }
 
 func sendPayload(t *testing.T, addr string, session uint32, payload []byte) {
 	t.Helper()
 	cfg := DefaultSenderConfig()
 	cfg.Session, cfg.RTO = session, 40*time.Millisecond
-	s, err := NewSender(addr, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	s := NewSender(dial(t, addr, "", 0), sysclock.New(), cfg)
 	if _, err := s.SendStream(bytes.NewReader(payload)); err != nil {
 		t.Fatalf("отправка сессии %08x не удалась: %v", session, err)
 	}
@@ -102,7 +107,7 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 // Сервер должен принимать сессии одну за другой и не завершаться после FIN.
 func TestServerSequentialSessions(t *testing.T) {
 	c := newCollector()
-	srv, stop := startServer(t, DefaultServerConfig(), c)
+	srv, stop := startServer(t, DefaultServerConfig(), c, 0)
 	defer stop()
 
 	want := map[uint32][]byte{}
@@ -127,8 +132,7 @@ func TestServerSequentialSessions(t *testing.T) {
 func TestServerConcurrentSessions(t *testing.T) {
 	c := newCollector()
 	cfg := DefaultServerConfig()
-	cfg.Loss = 0.05
-	srv, stop := startServer(t, cfg, c)
+	srv, stop := startServer(t, cfg, c, 0.05)
 	defer stop()
 
 	want := map[uint32][]byte{}
@@ -160,29 +164,19 @@ func TestServerEvictsIdleSession(t *testing.T) {
 	cfg.SessionIdle = 200 * time.Millisecond
 	var completed []bool
 	var mu sync.Mutex
-	cfg.OnSessionEnd = func(_ SessionInfo, _ ReceiverStats, ok bool) {
+	cfg.OnSessionEnd = func(_ port.SessionInfo, _ ReceiverStats, ok bool) {
 		mu.Lock()
 		completed = append(completed, ok)
 		mu.Unlock()
-		c.onEnd(SessionInfo{}, ReceiverStats{}, ok)
 	}
-	srv, err := NewServer("127.0.0.1:0", cfg, c.factory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.Serve(ctx)
+	srv, stop := startServer(t, cfg, c, 0)
+	defer stop()
 
 	// одиночный DATA без FIN — сессия открывается и повисает
-	s, err := NewSender(srv.LocalAddr().String(), SenderConfig{Session: 77})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	wire, _ := (&Packet{Type: TypeData, Session: 77, Seq: 0, Payload: []byte("частичный поток")}).Encode()
-	s.conn.Write(wire)
+	link := dial(t, srv.LocalAddr().String(), "", 0)
+	wire, _ := (&domain.Packet{Type: domain.TypeData, Session: 77, Seq: 0,
+		Payload: []byte("частичный поток")}).Encode()
+	link.Send(wire, nil)
 
 	waitFor(t, func() bool { return c.endedCount() == 1 }, "сессия не выселена по таймауту")
 	mu.Lock()
@@ -198,7 +192,7 @@ func TestServerEvictsIdleSession(t *testing.T) {
 // После завершения сессии сервер обязан продолжать работу.
 func TestServerKeepsListeningAfterSession(t *testing.T) {
 	c := newCollector()
-	srv, stop := startServer(t, DefaultServerConfig(), c)
+	srv, stop := startServer(t, DefaultServerConfig(), c, 0)
 	defer stop()
 
 	sendPayload(t, srv.LocalAddr().String(), 1, randomBytes(4096, 1))
@@ -217,11 +211,7 @@ func TestServerKeepsListeningAfterSession(t *testing.T) {
 // Serve завершается по отмене контекста, а не сам по себе.
 func TestServerStopsOnContext(t *testing.T) {
 	c := newCollector()
-	srv, err := NewServer("127.0.0.1:0", DefaultServerConfig(), c.factory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Close()
+	srv := NewServer(listen(t, 0), sysclock.New(), DefaultServerConfig(), c.factory)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ctx) }()

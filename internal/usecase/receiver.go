@@ -1,11 +1,11 @@
-package udpr
+package usecase
 
 import (
 	"context"
-	"fmt"
 	"io"
-	"net"
 	"time"
+
+	"github.com/argus/udpr/internal/port"
 )
 
 // ReceiverConfig — параметры одноразового приёма (команда recv): принять один
@@ -15,7 +15,6 @@ type ReceiverConfig struct {
 	IdleTimeout time.Duration // сколько ждать тишины до выхода
 	AckEvery    int           // ACK не чаще одного на N принятых пакетов (0 — window/4)
 	AckDelay    time.Duration // предел задержки отложенного ACK
-	Loss        float64       // имитация потерь обратного канала, 0..1
 	Verbose     bool
 }
 
@@ -25,20 +24,30 @@ func DefaultReceiverConfig() ReceiverConfig {
 		AckEvery: 8, AckDelay: 2 * time.Millisecond}
 }
 
-// ReceiverStats — счётчики по итогам приёма одного потока.
-type ReceiverStats struct {
-	Received   uint64
-	Dup        uint64
-	OutOfOrder uint64
-	Rejected   uint64
-	Acks       uint64
-	Bytes      uint64
+func normalizeIdle(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 10 * time.Second
+	}
+	return d
 }
 
-func (s ReceiverStats) String() string {
-	return fmt.Sprintf("received=%d dup=%d out_of_order=%d rejected=%d acks=%d bytes=%d",
-		s.Received, s.Dup, s.OutOfOrder, s.Rejected, s.Acks, s.Bytes)
+func serverConfig(cfg ReceiverConfig) ServerConfig {
+	return ServerConfig{
+		Window:        cfg.Window,
+		AckEvery:      cfg.AckEvery,
+		AckDelay:      cfg.AckDelay,
+		SessionIdle:   normalizeIdle(cfg.IdleTimeout),
+		MaxSessions:   1,
+		SingleSession: true,
+		Verbose:       cfg.Verbose,
+	}
 }
+
+// nopCloser отдаёт writer вызывающей стороны как приёмник сессии: закрывать
+// чужой поток одноразовый приём не вправе.
+type nopCloser struct{ io.Writer }
+
+func (nopCloser) Close() error { return nil }
 
 // Receiver принимает ровно один поток UDPR и завершается по FIN или по тишине
 // длиннее IdleTimeout. Это тонкая обёртка над Server: логика последовательности,
@@ -50,60 +59,23 @@ type Receiver struct {
 	stats ReceiverStats
 }
 
-func normalizeIdle(d time.Duration) time.Duration {
-	if d <= 0 {
-		return 10 * time.Second
-	}
-	return d
-}
-
-func serverConfig(cfg ReceiverConfig) ServerConfig {
-	cfg.IdleTimeout = normalizeIdle(cfg.IdleTimeout)
-	return ServerConfig{
-		Window:        cfg.Window,
-		AckEvery:      cfg.AckEvery,
-		AckDelay:      cfg.AckDelay,
-		SessionIdle:   cfg.IdleTimeout,
-		MaxSessions:   1,
-		SingleSession: true,
-		Loss:          cfg.Loss,
-		Verbose:       cfg.Verbose,
-	}
-}
-
-// NewReceiver слушает UDP на bind (например "0.0.0.0:5555").
-func NewReceiver(bind string, cfg ReceiverConfig) (*Receiver, error) {
+// NewReceiver собирает одноразовый приёмник поверх канала и часов.
+func NewReceiver(link port.Link, clock port.Clock, cfg ReceiverConfig) *Receiver {
 	r := &Receiver{idle: normalizeIdle(cfg.IdleTimeout)}
-	srv, err := NewServer(bind, serverConfig(cfg), r.sink)
-	if err != nil {
-		return nil, err
-	}
-	r.srv = srv
-	return r, nil
-}
-
-// NewReceiverConn собирает приёмник поверх готового сокета (для тестов).
-func NewReceiverConn(conn *net.UDPConn, cfg ReceiverConfig) *Receiver {
-	r := &Receiver{idle: normalizeIdle(cfg.IdleTimeout)}
-	r.srv = NewServerConn(conn, serverConfig(cfg), r.sink)
+	r.srv = NewServer(link, clock, serverConfig(cfg), r.sink)
 	return r
 }
 
-// Close закрывает сокет.
+// Close закрывает канал.
 func (r *Receiver) Close() error { return r.srv.Close() }
 
 // LocalAddr возвращает адрес прослушивания.
-func (r *Receiver) LocalAddr() net.Addr { return r.srv.LocalAddr() }
+func (r *Receiver) LocalAddr() port.Addr { return r.srv.LocalAddr() }
 
 // Stats возвращает счётчики принятого потока.
 func (r *Receiver) Stats() ReceiverStats { return r.stats }
 
-// writer подставляется на время ReceiveStream.
-type nopCloser struct{ io.Writer }
-
-func (nopCloser) Close() error { return nil }
-
-func (r *Receiver) sink(SessionInfo) (io.WriteCloser, error) {
+func (r *Receiver) sink(port.SessionInfo) (io.WriteCloser, error) {
 	return nopCloser{r.out}, nil
 }
 
@@ -113,7 +85,7 @@ func (r *Receiver) ReceiveStream(w io.Writer) (ReceiverStats, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	r.srv.cfg.OnSessionEnd = func(_ SessionInfo, st ReceiverStats, _ bool) {
+	r.srv.cfg.OnSessionEnd = func(_ port.SessionInfo, st ReceiverStats, _ bool) {
 		r.stats = st
 		cancel()
 	}
