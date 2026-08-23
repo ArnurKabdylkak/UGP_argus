@@ -5,16 +5,23 @@
 package usecase
 
 import (
+	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/big"
 	"time"
 
 	"github.com/argus/udpr/internal/domain"
 	"github.com/argus/udpr/internal/port"
 )
+
+// ErrDeliveryFailed — поток не доставлен: пакет исчерпал попытки повтора.
+// Для дата-диода это единственный отказ, ради которого стоит бить тревогу,
+// поэтому он отличим от ошибок сокета и чтения источника.
+var ErrDeliveryFailed = errors.New("udpr: поток не доставлен")
 
 // SenderConfig — параметры отправителя.
 type SenderConfig struct {
@@ -25,7 +32,9 @@ type SenderConfig struct {
 	AckRate    float64       // предел частоты ACK, шт/с
 	AckBurst   float64       // допустимый всплеск ACK
 	Session    uint32        // 0 — сгенерировать случайно
-	Verbose    bool
+
+	// Logger принимает диагностику. nil — молчать.
+	Logger *slog.Logger
 }
 
 // DefaultSenderConfig — разумные значения по умолчанию для MVP.
@@ -42,6 +51,29 @@ func DefaultSenderConfig() SenderConfig {
 	}
 }
 
+// Validate проверяет значения, заданные оператором. Ноль означает «взять
+// умолчание» и допустим везде; выход за пределы формата — ошибка, а не повод
+// молча подставить своё: канал настраивают под конкретное железо, и подмена
+// MTU или окна за спиной оператора хуже отказа запуска.
+func (c SenderConfig) Validate() error {
+	switch {
+	case c.MTU < 0 || c.MTU > domain.MaxPayload:
+		return fmt.Errorf("mtu=%d вне диапазона 1..%d", c.MTU, domain.MaxPayload)
+	case c.Window < 0 || c.Window > domain.BitmapBits:
+		return fmt.Errorf("window=%d вне диапазона 1..%d", c.Window, domain.BitmapBits)
+	case c.RTO < 0:
+		return fmt.Errorf("rto=%s отрицателен", c.RTO)
+	case c.MaxRetries < 0:
+		return fmt.Errorf("max-retries=%d отрицателен", c.MaxRetries)
+	case c.AckRate < 0 || c.AckBurst < 0:
+		return fmt.Errorf("ack-rate=%.0f и ack-burst=%.0f должны быть неотрицательны",
+			c.AckRate, c.AckBurst)
+	}
+	return nil
+}
+
+// normalize подставляет умолчания вместо нулей. Проверка допустимости — дело
+// Validate на границе приложения.
 func (c *SenderConfig) normalize() {
 	if c.MTU <= 0 || c.MTU > domain.MaxPayload {
 		c.MTU = domain.MaxPayload
@@ -61,8 +93,8 @@ func (c *SenderConfig) normalize() {
 	if c.AckBurst <= 0 {
 		c.AckBurst = 1024
 	}
-	if c.Session == 0 {
-		c.Session = randomSession()
+	if c.Logger == nil {
+		c.Logger = slog.New(slog.DiscardHandler)
 	}
 }
 
@@ -83,6 +115,7 @@ func (s SenderStats) String() string {
 // следит за таймаутами и выполняет повторную отправку.
 type Sender struct {
 	cfg   SenderConfig
+	log   *slog.Logger
 	link  port.Link
 	clock port.Clock
 	guard *domain.AckGuard
@@ -90,16 +123,26 @@ type Sender struct {
 	stats SenderStats
 }
 
-// NewSender собирает отправителя поверх канала и часов.
-func NewSender(link port.Link, clock port.Clock, cfg SenderConfig) *Sender {
+// NewSender собирает отправителя поверх канала и часов. Ошибка возможна
+// только при недоступном источнике случайности для идентификатора сессии:
+// подменять его предсказуемым значением молча нельзя.
+func NewSender(link port.Link, clock port.Clock, cfg SenderConfig) (*Sender, error) {
 	cfg.normalize()
+	if cfg.Session == 0 {
+		session, err := randomSession()
+		if err != nil {
+			return nil, err
+		}
+		cfg.Session = session
+	}
 	return &Sender{
 		cfg:   cfg,
+		log:   cfg.Logger.With("component", "sender", "session", cfg.Session),
 		link:  link,
 		clock: clock,
 		guard: domain.NewAckGuard(cfg.Session, cfg.AckRate, cfg.AckBurst),
 		win:   domain.NewWindow(cfg.Window),
-	}
+	}, nil
 }
 
 // Session возвращает идентификатор сессии.
@@ -111,12 +154,6 @@ func (s *Sender) Guard() *domain.AckGuard { return s.guard }
 // LocalAddr — адрес, на который придут подтверждения.
 func (s *Sender) LocalAddr() port.Addr { return s.link.LocalAddr() }
 
-func (s *Sender) logf(format string, a ...any) {
-	if s.cfg.Verbose {
-		log.Printf("[sender] "+format, a...)
-	}
-}
-
 // emit отправляет пакет окна и учитывает попытку.
 func (s *Sender) emit(seq uint32) {
 	wire, ok := s.win.Wire(seq)
@@ -126,10 +163,10 @@ func (s *Sender) emit(seq uint32) {
 	tries := s.win.MarkSent(seq, s.clock.Now())
 	if tries > 1 {
 		s.stats.Retransmit++
-		s.logf("retransmit seq=%d try=%d", seq, tries)
+		s.log.Debug("повторная отправка", "seq", seq, "try", tries)
 	}
 	if err := s.link.Send(wire, nil); err != nil {
-		s.logf("ошибка отправки: %v", err)
+		s.log.Debug("ошибка отправки", "seq", seq, "err", err)
 	}
 }
 
@@ -139,12 +176,16 @@ func (s *Sender) sendControl(p *domain.Packet) {
 		return
 	}
 	if err := s.link.Send(wire, nil); err != nil {
-		s.logf("ошибка отправки %s: %v", domain.TypeName(p.Type), err)
+		s.log.Debug("ошибка отправки", "type", domain.TypeName(p.Type), "err", err)
 	}
 }
 
 // SendStream заворачивает поток r в пакеты UDPR и доставляет их с гарантией.
-func (s *Sender) SendStream(r io.Reader) (SenderStats, error) {
+//
+// Отмена ctx прерывает передачу между итерациями цикла: повторы не должны
+// продолжаться после того, как оператор нажал Ctrl-C или истёк общий дедлайн.
+// Возвращается ctx.Err(), уже отправленное остаётся отправленным.
+func (s *Sender) SendStream(ctx context.Context, r io.Reader) (SenderStats, error) {
 	s.sendControl(&domain.Packet{
 		Type: domain.TypeHello, Session: s.cfg.Session, Window: uint16(s.cfg.Window),
 	})
@@ -152,6 +193,9 @@ func (s *Sender) SendStream(r io.Reader) (SenderStats, error) {
 	buf := make([]byte, s.cfg.MTU)
 	eof := false
 	for !eof || !s.win.Empty() {
+		if err := ctx.Err(); err != nil {
+			return s.stats, err
+		}
 		for !eof && s.win.CanQueue() {
 			n, err := io.ReadFull(r, buf)
 			if n > 0 {
@@ -210,13 +254,13 @@ func (s *Sender) applyDatagram(dg port.Datagram) {
 	ack, err := domain.Decode(dg.Payload)
 	if err != nil {
 		s.guard.Drop(err.Error())
-		s.logf("отброшен пакет: %v", err)
+		s.log.Debug("отброшен пакет обратного канала", "err", err)
 		return
 	}
 	now := s.clock.Now()
 	if !s.guard.Check(ack, s.win.Base(), s.win.Next(), now) {
 		_, reason := s.guard.Stats()
-		s.logf("ACK Guard отклонил: %s", reason)
+		s.log.Debug("ACK Guard отклонил пакет", "reason", reason)
 		return
 	}
 	s.stats.Acks++
@@ -229,17 +273,19 @@ func (s *Sender) checkTimeouts() error {
 	now := s.clock.Now()
 	for _, seq := range s.win.Expired(now, s.cfg.RTO) {
 		if s.win.Tries(seq) > s.cfg.MaxRetries {
-			return fmt.Errorf("udpr: seq=%d не доставлен после %d попыток", seq, s.win.Tries(seq))
+			return fmt.Errorf("%w: seq=%d исчерпал %d попыток", ErrDeliveryFailed, seq, s.win.Tries(seq))
 		}
 		s.emit(seq)
 	}
 	return nil
 }
 
-func randomSession() uint32 {
+// randomSession выдаёт идентификатор сессии. Младший бит выставлен, чтобы
+// значение не оказалось нулём: ноль в конфигурации означает «сгенерировать».
+func randomSession() (uint32, error) {
 	n, err := rand.Int(rand.Reader, big.NewInt(1<<32-1))
 	if err != nil {
-		return uint32(time.Now().UnixNano()) | 1
+		return 0, fmt.Errorf("udpr: нет источника случайности для session_id: %w", err)
 	}
-	return uint32(n.Uint64()) | 1
+	return uint32(n.Uint64()) | 1, nil
 }

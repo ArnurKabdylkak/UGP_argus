@@ -55,6 +55,10 @@ type session struct {
 	ackDelay time.Duration
 	clock    port.Clock
 	send     func(*domain.Packet, port.Addr)
+
+	// ack переиспользуется под исходящие подтверждения: при 20k ACK/с
+	// отдельный буфер на каждое — постоянный мусор
+	ack domain.Packet
 }
 
 func newSession(id uint32, peer port.Addr, sink io.Writer, cfg ServerConfig,
@@ -75,13 +79,14 @@ func (s *session) sendAck() {
 	s.ackPending = false
 	s.lastAck = s.clock.Now()
 	s.stats.Acks++
-	s.send(&domain.Packet{
+	s.ack = domain.Packet{
 		Type:      domain.TypeAck,
 		Session:   s.id,
 		Window:    uint16(s.window),
 		AckBase:   s.asm.Expected(),
 		AckBitmap: s.asm.Bitmap(),
-	}, s.peer)
+	}
+	s.send(&s.ack, s.peer)
 }
 
 // scheduleAck решает, слать ли ACK сейчас. Подтверждение на каждый пакет
@@ -143,10 +148,8 @@ func (s *session) onData(p *domain.Packet) error {
 		}
 		s.stats.Received++
 		s.stats.Bytes += uint64(len(p.Payload))
-		for _, chunk := range s.asm.Drain() {
-			if _, err := s.sink.Write(chunk); err != nil {
-				return err
-			}
+		if err := s.asm.DrainTo(s.sink); err != nil {
+			return err
 		}
 		// дырка в потоке — подтверждаем сразу, чтобы отправитель увидел её
 		s.scheduleAck(s.asm.HasGap())

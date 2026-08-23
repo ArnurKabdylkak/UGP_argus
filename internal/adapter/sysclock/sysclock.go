@@ -1,7 +1,13 @@
 // Package sysclock реализует port.Clock поверх системных часов.
 package sysclock
 
-import "time"
+import (
+	"time"
+
+	"github.com/argus/udpr/internal/port"
+)
+
+var _ port.Clock = Clock{}
 
 // Clock отдаёт настоящее время.
 type Clock struct{}

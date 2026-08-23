@@ -11,7 +11,11 @@ import (
 	"github.com/argus/udpr/internal/port"
 )
 
+var _ port.Link = (*Link)(nil)
+
 // Link оборачивает канал и отбрасывает часть исходящих датаграмм.
+// Ограничения на параллельность те же, что у обёрнутого канала: Send
+// потокобезопасен, Recv — только из одной горутины.
 type Link struct {
 	inner port.Link
 	rate  float64

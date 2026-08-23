@@ -57,7 +57,11 @@ func (c *collector) endedCount() int {
 
 // startServer поднимает сервер на loopback. Собственный OnSessionEnd теста
 // сохраняется — счётчик коллектора довешивается к нему.
-func startServer(t *testing.T, cfg ServerConfig, c *collector, loss float64) (*Server, context.CancelFunc) {
+//
+// Возвращённая функция останова дожидается выхода Serve: иначе горутина
+// пережила бы тест, а её t.Errorf после завершения теста — паника рантайма
+// вместо отчёта об ошибке.
+func startServer(t *testing.T, cfg ServerConfig, c *collector, loss float64) (*Server, func()) {
 	t.Helper()
 	prev := cfg.OnSessionEnd
 	cfg.OnSessionEnd = func(info port.SessionInfo, st ReceiverStats, ok bool) {
@@ -68,20 +72,34 @@ func startServer(t *testing.T, cfg ServerConfig, c *collector, loss float64) (*S
 	}
 	srv := NewServer(listen(t, loss), sysclock.New(), cfg, c.factory)
 	ctx, cancel := context.WithCancel(context.Background())
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	errc := make(chan error, 1)
 	go func() {
+		defer wg.Done()
 		if err := srv.Serve(ctx); err != nil {
-			t.Errorf("Serve вернул ошибку: %v", err)
+			errc <- err
 		}
 	}()
-	return srv, cancel
+
+	return srv, func() {
+		cancel()
+		wg.Wait()
+		select {
+		case err := <-errc:
+			t.Errorf("Serve вернул ошибку: %v", err)
+		default:
+		}
+	}
 }
 
 func sendPayload(t *testing.T, addr string, session uint32, payload []byte) {
 	t.Helper()
 	cfg := DefaultSenderConfig()
 	cfg.Session, cfg.RTO = session, 40*time.Millisecond
-	s := NewSender(dial(t, addr, "", 0), sysclock.New(), cfg)
-	if _, err := s.SendStream(bytes.NewReader(payload)); err != nil {
+	s := newSender(t, dial(t, addr, "", 0), cfg)
+	if _, err := s.SendStream(t.Context(), bytes.NewReader(payload)); err != nil {
 		t.Fatalf("отправка сессии %08x не удалась: %v", session, err)
 	}
 }

@@ -8,7 +8,6 @@ package app
 
 import (
 	"fmt"
-	"log"
 	"os"
 )
 
@@ -25,7 +24,6 @@ type command func(args []string) error
 // Run выполняет команду, заданную аргументами (без имени программы), и
 // возвращает код возврата процесса.
 func Run(args []string) int {
-	log.SetFlags(0)
 	if len(args) == 0 {
 		usage()
 		return exitUsage
@@ -60,7 +58,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `udpr — UDP + Reliable Transport для дата-диода
 
   udpr send     -host HOST [-port N] [-file PATH|-] [-mtu N] [-window N] [-rto D]
-                [-lport N | -laddr ADDR] [-loss F] [-v]
+                [-lport N | -laddr ADDR] [-deadline D] [-loss F] [-v]
   udpr recv     [-bind ADDR] [-port N] [-out PATH|-] [-window N] [-idle D] [-loss F] [-v]
   udpr serve    [-bind ADDR] [-port N] -dir PATH [-window N] [-idle D] [-max N] [-v]
   udpr selftest [-size N] [-loss F] [-window N] [-mtu N] [-rto D] [-v]
@@ -74,5 +72,9 @@ func usage() {
 на межсетевом экране.
 
 Флаг -loss имитирует потери канала и нужен для проверки retransmit.
+Флаг -deadline у send ограничивает передачу по времени целиком.
+
+Значения по умолчанию можно задать окружением: UDPR_BIND, UDPR_PORT, UDPR_DIR,
+UDPR_WINDOW, UDPR_IDLE, UDPR_MAX. Явный флаг всегда сильнее переменной.
 `)
 }

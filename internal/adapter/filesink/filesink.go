@@ -12,6 +12,8 @@ import (
 	"github.com/argus/udpr/internal/port"
 )
 
+var _ io.WriteCloser = (*bufferedFile)(nil)
+
 // Factory возвращает фабрику приёмников, пишущую потоки в каталог dir файлами
 // вида <timestamp>-<session>.bin. Непустой notify получает имя созданного
 // файла — через него команда сообщает оператору, куда легла сессия.

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -23,10 +23,31 @@ type ServerConfig struct {
 	// SingleSession принимает ровно один поток и отбрасывает всё остальное —
 	// режим одноразового приёма (команда recv).
 	SingleSession bool
-	Verbose       bool
+
+	// Logger принимает диагностику. nil — молчать.
+	Logger *slog.Logger
 
 	// OnSessionEnd вызывается при завершении или выселении сессии.
 	OnSessionEnd func(port.SessionInfo, ReceiverStats, bool)
+}
+
+// Validate проверяет значения, заданные оператором. Ноль означает «взять
+// умолчание»; выход за пределы формата — ошибка, а не повод молча подставить
+// своё.
+func (c ServerConfig) Validate() error {
+	switch {
+	case c.Window < 0 || c.Window > domain.BitmapBits:
+		return fmt.Errorf("window=%d вне диапазона 1..%d", c.Window, domain.BitmapBits)
+	case c.AckEvery < 0:
+		return fmt.Errorf("ack-every=%d отрицателен", c.AckEvery)
+	case c.AckDelay < 0:
+		return fmt.Errorf("ack-delay=%s отрицателен", c.AckDelay)
+	case c.SessionIdle < 0:
+		return fmt.Errorf("idle=%s отрицателен", c.SessionIdle)
+	case c.MaxSessions < 0:
+		return fmt.Errorf("max=%d отрицателен", c.MaxSessions)
+	}
+	return nil
 }
 
 // DefaultServerConfig — значения по умолчанию для постоянного приёма.
@@ -40,6 +61,8 @@ func DefaultServerConfig() ServerConfig {
 	}
 }
 
+// normalize подставляет умолчания вместо нулей. Проверка допустимости — дело
+// Validate на границе приложения.
 func (c *ServerConfig) normalize() {
 	if c.Window <= 0 || c.Window > domain.BitmapBits {
 		c.Window = domain.BitmapBits
@@ -58,6 +81,9 @@ func (c *ServerConfig) normalize() {
 	}
 	if c.MaxSessions <= 0 {
 		c.MaxSessions = 64
+	}
+	if c.Logger == nil {
+		c.Logger = slog.New(slog.DiscardHandler)
 	}
 }
 
@@ -83,12 +109,17 @@ func (t Totals) String() string {
 // в этом слое нет.
 type Server struct {
 	cfg     ServerConfig
+	log     *slog.Logger
 	link    port.Link
 	clock   port.Clock
 	factory port.SinkFactory
 
 	sessions map[sessionKey]*session
 	sinks    map[sessionKey]io.Closer
+
+	// буфер исходящих: сериализация живёт в горутине Serve, поэтому один
+	// буфер на сервер вместо аллокации на каждый ACK
+	wire []byte
 
 	// счётчики читаются снаружи (мониторинг, тесты), поэтому под мьютексом;
 	// сами сессии живут в одной горутине Serve и блокировки не требуют
@@ -101,11 +132,13 @@ func NewServer(link port.Link, clock port.Clock, cfg ServerConfig, factory port.
 	cfg.normalize()
 	return &Server{
 		cfg:      cfg,
+		log:      cfg.Logger.With("component", "server"),
 		link:     link,
 		clock:    clock,
 		factory:  factory,
-		sessions: make(map[sessionKey]*session),
-		sinks:    make(map[sessionKey]io.Closer),
+		sessions: make(map[sessionKey]*session, cfg.MaxSessions),
+		sinks:    make(map[sessionKey]io.Closer, cfg.MaxSessions),
+		wire:     make([]byte, 0, domain.HeaderLen),
 	}
 }
 
@@ -129,19 +162,14 @@ func (s *Server) bump(f func(*Totals)) {
 	f(&s.total)
 }
 
-func (s *Server) logf(format string, a ...any) {
-	if s.cfg.Verbose {
-		log.Printf("[server] "+format, a...)
-	}
-}
-
 func (s *Server) sendPacket(p *domain.Packet, dst port.Addr) {
-	wire, err := p.Encode()
+	wire, err := p.AppendTo(s.wire[:0])
 	if err != nil {
 		return
 	}
+	s.wire = wire
 	if err := s.link.Send(wire, dst); err != nil {
-		s.logf("ошибка отправки ACK: %v", err)
+		s.log.Debug("ошибка отправки ACK", "peer", dst, "err", err)
 	}
 }
 
@@ -177,11 +205,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		p, decErr := domain.Decode(dg.Payload)
 		if decErr != nil {
 			s.bump(func(t *Totals) { t.Rejected++ })
-			s.logf("отброшен пакет от %s: %v", dg.Peer, decErr)
+			s.log.Debug("отброшен пакет", "peer", dg.Peer, "err", decErr)
 			continue
 		}
 		if err := s.dispatch(p, dg.Peer); err != nil {
-			s.logf("сессия %08x: %v", p.Session, err)
+			s.log.Warn("сессия завершена с ошибкой", "session", p.Session, "err", err)
 		}
 		s.evictIdle()
 	}
@@ -216,7 +244,7 @@ func (s *Server) dispatch(p *domain.Packet, src port.Addr) error {
 		s.sessions[key] = sess
 		s.sinks[key] = sink
 		s.bump(func(t *Totals) { t.Sessions++ })
-		s.logf("новая сессия %s", info)
+		s.log.Info("новая сессия", "session", info.Session, "peer", info.Peer)
 	}
 
 	done, err := sess.handle(p)
@@ -244,8 +272,12 @@ func (s *Server) finish(key sessionKey, sess *session, completed bool) {
 			t.Evicted++
 		}
 	})
-	s.logf("сессия %08x завершена (%s), %s", sess.id,
-		map[bool]string{true: "поток закрыт", false: "прервана"}[completed], sess.stats)
+	outcome := "прервана"
+	if completed {
+		outcome = "поток закрыт"
+	}
+	s.log.Info("сессия закрыта", "session", sess.id, "outcome", outcome,
+		"bytes", sess.stats.Bytes, "stats", sess.stats)
 	if s.cfg.OnSessionEnd != nil {
 		s.cfg.OnSessionEnd(port.SessionInfo{Session: sess.id, Peer: sess.peer, Started: sess.started},
 			sess.stats, completed)
@@ -273,8 +305,8 @@ func (s *Server) evictIdle() {
 	now := s.clock.Now()
 	for key, sess := range s.sessions {
 		if now.Sub(sess.lastSeen) > s.cfg.SessionIdle {
-			s.logf("сессия %08x выселена по таймауту, доставлено %d байт (не завершена)",
-				sess.id, sess.stats.Bytes)
+			s.log.Warn("сессия выселена по таймауту (поток не завершён)",
+				"session", sess.id, "bytes", sess.stats.Bytes)
 			s.finish(key, sess, false)
 		}
 	}

@@ -2,11 +2,14 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/argus/udpr/internal/adapter/sysclock"
@@ -41,18 +44,31 @@ func cmdSelftest(args []string) error {
 	defer closer.Close()
 
 	rcfg := usecase.DefaultReceiverConfig()
-	rcfg.Window, rcfg.Verbose, rcfg.IdleTimeout = *window, *verbose, 5*time.Second
+	rcfg.Window, rcfg.IdleTimeout = *window, 5*time.Second
+	rcfg.Logger = newLogger(*verbose)
+	if err := rcfg.Validate(); err != nil {
+		return err
+	}
 	r := usecase.NewReceiver(rlink, sysclock.New(), rcfg)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	rxCtx, stopRx := context.WithCancel(ctx)
+	defer stopRx()
 
 	var sink bytes.Buffer
 	done := make(chan usecase.ReceiverStats, 1)
 	go func() {
-		st, _ := r.ReceiveStream(&sink)
+		st, _ := r.ReceiveStream(rxCtx, &sink)
 		done <- st
 	}()
 
 	scfg := usecase.DefaultSenderConfig()
-	scfg.MTU, scfg.Window, scfg.RTO, scfg.Verbose = *mtu, *window, *rto, *verbose
+	scfg.MTU, scfg.Window, scfg.RTO = *mtu, *window, *rto
+	scfg.Logger = newLogger(*verbose)
+	if err := scfg.Validate(); err != nil {
+		return err
+	}
 	s, slink, err := dialSender(r.LocalAddr().String(), "", *loss, scfg)
 	if err != nil {
 		return err
@@ -60,14 +76,19 @@ func cmdSelftest(args []string) error {
 	defer slink.Close()
 
 	start := time.Now()
-	txStats, err := s.SendStream(bytes.NewReader(payload))
+	txStats, err := s.SendStream(ctx, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
+
+	// приёмник закрывается сам по FIN; таймер — только страховка от зависания,
+	// и теперь он не бросает горутину, а отменяет её через контекст
 	var rxStats usecase.ReceiverStats
 	select {
 	case rxStats = <-done:
 	case <-time.After(20 * time.Second):
+		stopRx()
+		<-done
 		return fmt.Errorf("приёмник не завершился за 20 с")
 	}
 	elapsed := time.Since(start).Seconds()

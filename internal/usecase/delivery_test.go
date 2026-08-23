@@ -2,7 +2,9 @@ package usecase
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"errors"
 	"math/rand"
 	"net"
 	"strconv"
@@ -39,6 +41,16 @@ func dial(t *testing.T, remote, local string, loss float64) port.Link {
 	return lossylink.Wrap(link, loss)
 }
 
+// newSender собирает отправителя поверх готового канала.
+func newSender(t *testing.T, link port.Link, cfg SenderConfig) *Sender {
+	t.Helper()
+	s, err := NewSender(link, sysclock.New(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 // runTransfer гоняет size байт через loopback при заданных потерях канала.
 func runTransfer(t *testing.T, size int, loss float64) {
 	t.Helper()
@@ -50,17 +62,17 @@ func runTransfer(t *testing.T, size int, loss float64) {
 	var sink bytes.Buffer
 	done := make(chan error, 1)
 	go func() {
-		_, err := r.ReceiveStream(&sink)
+		_, err := r.ReceiveStream(t.Context(), &sink)
 		done <- err
 	}()
 
 	scfg := DefaultSenderConfig()
 	scfg.RTO = 80 * time.Millisecond
-	s := NewSender(dial(t, r.LocalAddr().String(), "", loss), sysclock.New(), scfg)
+	s := newSender(t, dial(t, r.LocalAddr().String(), "", loss), scfg)
 
 	payload := make([]byte, size)
 	rand.New(rand.NewSource(1)).Read(payload)
-	if _, err := s.SendStream(bytes.NewReader(payload)); err != nil {
+	if _, err := s.SendStream(t.Context(), bytes.NewReader(payload)); err != nil {
 		t.Fatalf("отправка не удалась: %v", err)
 	}
 
@@ -91,7 +103,7 @@ func TestReceiverRejectsForeignSession(t *testing.T) {
 
 	var sink bytes.Buffer
 	done := make(chan struct{})
-	go func() { r.ReceiveStream(&sink); close(done) }()
+	go func() { r.ReceiveStream(t.Context(), &sink); close(done) }()
 
 	link := dial(t, r.LocalAddr().String(), "", 0)
 
@@ -128,12 +140,12 @@ func TestSenderFixedLocalPort(t *testing.T) {
 	scfg := DefaultSenderConfig()
 	scfg.RTO = 40 * time.Millisecond
 	want := "127.0.0.1:" + strconv.Itoa(localPort)
-	s := NewSender(dial(t, srv.LocalAddr().String(), want, 0), sysclock.New(), scfg)
+	s := newSender(t, dial(t, srv.LocalAddr().String(), want, 0), scfg)
 
 	if got := s.LocalAddr().String(); got != want {
 		t.Fatalf("сокет привязан к %s, ожидалось %s", got, want)
 	}
-	if _, err := s.SendStream(bytes.NewReader([]byte("фиксированный порт"))); err != nil {
+	if _, err := s.SendStream(t.Context(), bytes.NewReader([]byte("фиксированный порт"))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -162,5 +174,49 @@ func TestSenderLocalPortBusy(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "локальный порт") {
 		t.Fatalf("непонятная ошибка: %v", err)
+	}
+}
+
+// Отмена контекста обязана прерывать передачу: без этого Ctrl-C у send убивал
+// процесс посреди потока, а общий дедлайн было нечем задать.
+func TestSendStreamHonoursContext(t *testing.T) {
+	// сокет открыт, но никто не читает и не подтверждает: отправитель уходит
+	// в бесконечные повторы, выйти можно только по отмене
+	quiet := listen(t, 0)
+	link := dial(t, quiet.LocalAddr().String(), "", 0)
+	cfg := DefaultSenderConfig()
+	cfg.RTO, cfg.MaxRetries = 10*time.Millisecond, 1000
+	s := newSender(t, link, cfg)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.SendStream(ctx, bytes.NewReader(make([]byte, 1<<20)))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("вернулась ошибка %v, ожидался истёкший дедлайн", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("передача не прервалась по истечении дедлайна")
+	}
+}
+
+// Исчерпание попыток — отдельный отказ: для диода это единственная причина
+// бить тревогу, и она обязана быть отличима от ошибок сокета.
+func TestSendStreamDeliveryFailedIsSentinel(t *testing.T) {
+	link := dial(t, "127.0.0.1:9", "", 1) // канал теряет всё
+	cfg := DefaultSenderConfig()
+	cfg.RTO, cfg.MaxRetries = time.Millisecond, 2
+	s := newSender(t, link, cfg)
+
+	_, err := s.SendStream(t.Context(), bytes.NewReader([]byte("поток")))
+	if !errors.Is(err, ErrDeliveryFailed) {
+		t.Fatalf("вернулась ошибка %v, ожидалась ErrDeliveryFailed", err)
 	}
 }

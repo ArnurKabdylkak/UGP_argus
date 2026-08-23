@@ -17,7 +17,12 @@ func dialSender(remote, local string, loss float64, cfg usecase.SenderConfig) (*
 	if err != nil {
 		return nil, nil, err
 	}
-	return usecase.NewSender(lossylink.Wrap(link, loss), sysclock.New(), cfg), link, nil
+	sender, err := usecase.NewSender(lossylink.Wrap(link, loss), sysclock.New(), cfg)
+	if err != nil {
+		link.Close()
+		return nil, nil, err
+	}
+	return sender, link, nil
 }
 
 // listenLink открывает канал приёма на bind. Возвращается и обёрнутый канал

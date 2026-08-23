@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"slices"
 )
 
 // Version — версия формата. Пакеты другой версии отбрасываются.
@@ -48,7 +49,21 @@ const (
 	HeaderLen  = 28
 	BitmapBits = 32 // размер ACK bitmap задан форматом
 	MaxPayload = 1400 - HeaderLen
+
+	crcOffset = 24 // смещение поля crc32 в заголовке
 )
+
+// crcZero подставляется вместо самого поля crc32 при подсчёте контрольной
+// суммы. Пакет для этого не копируется: сумма считается по трём кускам.
+var crcZero [4]byte
+
+// checksum считает CRC32 пакета так, как задано форматом: по заголовку с
+// обнулённым полем crc32 плюс payload.
+func checksum(raw []byte) uint32 {
+	sum := crc32.ChecksumIEEE(raw[:crcOffset])
+	sum = crc32.Update(sum, crc32.IEEETable, crcZero[:])
+	return crc32.Update(sum, crc32.IEEETable, raw[HeaderLen:])
+}
 
 // ErrBadPacket — пакет не соответствует формату UDPR.
 var ErrBadPacket = errors.New("udpr: некорректный пакет")
@@ -65,13 +80,25 @@ type Packet struct {
 	Payload   []byte
 }
 
-// Encode сериализует пакет и считает CRC32 по заголовку с обнулённым полем CRC
-// плюс payload.
+// Encode сериализует пакет в новый буфер точного размера.
 func (p *Packet) Encode() ([]byte, error) {
+	return p.AppendTo(nil)
+}
+
+// AppendTo дописывает сериализованный пакет в dst и возвращает результат.
+// Позволяет переиспользовать буфер там, где пакеты уходят потоком: ACK на
+// каждую сессию иначе аллоцировал бы заголовок на каждое подтверждение.
+//
+// Вызов вида buf = p.AppendTo(buf[:0]) не аллоцирует, пока ёмкости хватает.
+func (p *Packet) AppendTo(dst []byte) ([]byte, error) {
 	if len(p.Payload) > 0xFFFF {
 		return nil, fmt.Errorf("%w: payload %d байт", ErrBadPacket, len(p.Payload))
 	}
-	buf := make([]byte, HeaderLen+len(p.Payload))
+	size := HeaderLen + len(p.Payload)
+	dst = slices.Grow(dst, size)
+	buf := dst[len(dst) : len(dst)+size]
+	clear(buf)
+
 	buf[0] = Version
 	buf[1] = p.Type
 	buf[2] = p.Flags
@@ -83,8 +110,8 @@ func (p *Packet) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint32(buf[16:], p.AckBase)
 	binary.BigEndian.PutUint32(buf[20:], p.AckBitmap)
 	copy(buf[HeaderLen:], p.Payload)
-	binary.BigEndian.PutUint32(buf[24:], crc32.ChecksumIEEE(buf))
-	return buf, nil
+	binary.BigEndian.PutUint32(buf[crcOffset:], checksum(buf))
+	return dst[:len(dst)+size], nil
 }
 
 // Decode разбирает пакет и проверяет версию, тип, длину и CRC.
@@ -105,10 +132,7 @@ func Decode(raw []byte) (*Packet, error) {
 		return nil, fmt.Errorf("%w: length=%d, фактически %d", ErrBadPacket, length, len(payload))
 	}
 
-	zeroed := make([]byte, len(raw))
-	copy(zeroed, raw)
-	binary.BigEndian.PutUint32(zeroed[24:], 0)
-	if got := crc32.ChecksumIEEE(zeroed); got != binary.BigEndian.Uint32(raw[24:]) {
+	if checksum(raw) != binary.BigEndian.Uint32(raw[crcOffset:]) {
 		return nil, fmt.Errorf("%w: CRC не сходится", ErrBadPacket)
 	}
 
@@ -122,7 +146,9 @@ func Decode(raw []byte) (*Packet, error) {
 		AckBitmap: binary.BigEndian.Uint32(raw[20:]),
 	}
 	if length > 0 {
-		p.Payload = append([]byte(nil), payload...)
+		// буфер канала переиспользуется: без копии payload затрёт следующая
+		// датаграмма
+		p.Payload = slices.Clone(payload)
 	}
 	return p, nil
 }

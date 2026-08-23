@@ -18,12 +18,12 @@ import (
 
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	bind := fs.String("bind", "0.0.0.0", "адрес прослушивания")
-	udpPort := fs.Int("port", 5555, "порт прослушивания")
-	dir := fs.String("dir", "", "каталог для принятых потоков (обязательно)")
-	window := fs.Int("window", 32, "окно приёма в пакетах (<=32)")
-	idle := fs.Duration("idle", 60*time.Second, "выселение замолчавшей сессии")
-	max := fs.Int("max", 64, "предел одновременных сессий")
+	bind := fs.String("bind", envString("UDPR_BIND", "0.0.0.0"), "адрес прослушивания")
+	udpPort := fs.Int("port", envInt("UDPR_PORT", 5555), "порт прослушивания")
+	dir := fs.String("dir", envString("UDPR_DIR", ""), "каталог для принятых потоков (обязательно)")
+	window := fs.Int("window", envInt("UDPR_WINDOW", 32), "окно приёма в пакетах (<=32)")
+	idle := fs.Duration("idle", envDuration("UDPR_IDLE", 60*time.Second), "выселение замолчавшей сессии")
+	max := fs.Int("max", envInt("UDPR_MAX", 64), "предел одновременных сессий")
 	loss := fs.Float64("loss", 0, "имитация потерь обратного канала, 0..1")
 	verbose := fs.Bool("v", false, "подробный лог")
 	if err := fs.Parse(args); err != nil {
@@ -38,7 +38,10 @@ func cmdServe(args []string) error {
 
 	cfg := usecase.DefaultServerConfig()
 	cfg.Window, cfg.SessionIdle, cfg.MaxSessions = *window, *idle, *max
-	cfg.Verbose = *verbose
+	cfg.Logger = newLogger(*verbose)
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	cfg.OnSessionEnd = func(info port.SessionInfo, stats usecase.ReceiverStats, completed bool) {
 		status := "ЗАВЕРШЕНА"
 		if !completed {
@@ -63,8 +66,8 @@ func cmdServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Fprintf(os.Stderr, "[serve] слушаю %s, каталог %s (Ctrl-C для остановки)\n",
-		srv.LocalAddr(), *dir)
+	fmt.Fprintf(os.Stderr, "[serve] слушаю %s, каталог %s%s (Ctrl-C для остановки)\n",
+		srv.LocalAddr(), *dir, envNote(fs))
 	err = srv.Serve(ctx)
 	fmt.Fprintf(os.Stderr, "[serve] остановлен, итоги: %s\n", srv.Totals())
 	return err

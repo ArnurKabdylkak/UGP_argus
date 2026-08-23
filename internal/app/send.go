@@ -1,10 +1,13 @@
 package app
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/argus/udpr/internal/domain"
@@ -21,6 +24,7 @@ func cmdSend(args []string) error {
 	rto := fs.Duration("rto", 250*time.Millisecond, "таймаут повторной отправки")
 	lport := fs.Int("lport", 0, "фиксированный локальный порт (0 — эфемерный)")
 	laddr := fs.String("laddr", "", "фиксированный локальный адрес, перекрывает -lport")
+	deadline := fs.Duration("deadline", 0, "общий предел времени передачи (0 — без предела)")
 	loss := fs.Float64("loss", 0, "имитация потерь канала, 0..1")
 	verbose := fs.Bool("v", false, "подробный лог")
 	if err := fs.Parse(args); err != nil {
@@ -42,7 +46,11 @@ func cmdSend(args []string) error {
 		local = net.JoinHostPort("", fmt.Sprint(*lport))
 	}
 	cfg := usecase.DefaultSenderConfig()
-	cfg.MTU, cfg.Window, cfg.RTO, cfg.Verbose = *mtu, *window, *rto, *verbose
+	cfg.MTU, cfg.Window, cfg.RTO = *mtu, *window, *rto
+	cfg.Logger = newLogger(*verbose)
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 
 	s, link, err := dialSender(net.JoinHostPort(*host, fmt.Sprint(*port)), local, *loss, cfg)
 	if err != nil {
@@ -54,8 +62,16 @@ func cmdSend(args []string) error {
 	fmt.Fprintf(os.Stderr, "[send] %s -> %s:%d, сессия %08x\n",
 		s.LocalAddr(), *host, *port, s.Session())
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if *deadline > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *deadline)
+		defer cancel()
+	}
+
 	start := time.Now()
-	stats, err := s.SendStream(in)
+	stats, err := s.SendStream(ctx, in)
 	fmt.Fprintf(os.Stderr, "[send] %s, время %.2f c\n", stats, time.Since(start).Seconds())
 	if n, reason := s.Guard().Stats(); n > 0 {
 		fmt.Fprintf(os.Stderr, "[send] ACK Guard отклонил %d пакетов (последний: %s)\n", n, reason)
