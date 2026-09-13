@@ -58,6 +58,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `udpr — UDP + Reliable Transport для дата-диода
 
   udpr send     -host HOST [-port N] [-file PATH|-] [-mtu N] [-window N] [-rto D]
+                [-min-rto D] [-max-rto D] [-bitrate MBIT]
                 [-lport N | -laddr ADDR] [-deadline D] [-loss F] [-v]
   udpr recv     [-bind ADDR] [-port N] [-out PATH|-] [-window N] [-idle D] [-loss F] [-v]
   udpr serve    [-bind ADDR] [-port N] -dir PATH [-window N] [-idle D] [-max N] [-v]
@@ -70,6 +71,12 @@ func usage() {
 Флаги -lport/-laddr закрепляют локальный порт отправителя: без них ОС выдаёт
 эфемерный порт, и обратный ACK-канал нельзя описать постоянным правилом
 на межсетевом экране.
+
+Таймаут повтора адаптивный: -rto задаёт лишь начальное значение, дальше он
+выводится из измеренного времени оборота и удерживается в -min-rto..-max-rto.
+
+Флаг -bitrate ограничивает скорость выдачи в канал: вспышка на скорости
+процессора переполняет очередь сетевой карты и приёмный буфер.
 
 Флаг -loss имитирует потери канала и нужен для проверки retransmit.
 Флаг -deadline у send ограничивает передачу по времени целиком.

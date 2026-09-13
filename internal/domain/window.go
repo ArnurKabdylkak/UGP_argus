@@ -35,6 +35,12 @@ type Window struct {
 	resend  []uint32
 	expired []uint32
 	holes   []uint32
+
+	// измерение оборота: срок жизни последнего подтверждённого пакета,
+	// отправленного ровно один раз (алгоритм Карна)
+	sample     time.Duration
+	sampleSeq  uint32
+	haveSample bool
 }
 
 // NewWindow создаёт окно заданного размера в пакетах.
@@ -126,12 +132,16 @@ func (w *Window) Tries(seq uint32) int {
 //
 // ack_base — первый ещё НЕ полученный seq; бит i карты соответствует
 // seq = ack_base+1+i. Дырка ниже уже подтверждённого пакета означает потерю,
-// а не задержку, поэтому её не ждут по таймауту. Повтор разрешается не чаще
-// одного раза за rto/2: поток дублирующихся ACK иначе разгоняет лишние
-// передачи.
-func (w *Window) Ack(ackBase, bitmap uint32, now time.Time, rto time.Duration) []uint32 {
+// а не задержку, поэтому её не ждут по таймауту. Повтор одного и того же seq
+// разрешается не чаще одного раза за resendGap: этот интервал задаётся
+// оценкой оборота, потому что предыдущая попытка ещё может быть в пути.
+//
+// Попутно снимается измерение оборота: берётся самый свежий подтверждённый
+// пакет, отправленный ровно один раз.
+func (w *Window) Ack(ackBase, bitmap uint32, now time.Time, resendGap time.Duration) []uint32 {
 	for i := range w.ring {
 		if e := &w.ring[i]; e.live && e.seq < ackBase {
+			w.takeSample(e, now)
 			*e = entry{}
 			w.live--
 		}
@@ -147,6 +157,9 @@ func (w *Window) Ack(ackBase, bitmap uint32, now time.Time, rto time.Duration) [
 	for i := 0; i < BitmapBits; i++ {
 		seq := ackBase + 1 + uint32(i)
 		if bitmap>>uint(i)&1 == 1 {
+			if e := w.slot(seq); e != nil {
+				w.takeSample(e, now)
+			}
 			w.drop(seq)
 			top, haveTop = seq, true
 		} else if w.slot(seq) != nil {
@@ -163,12 +176,35 @@ func (w *Window) Ack(ackBase, bitmap uint32, now time.Time, rto time.Duration) [
 		}
 		e := w.slot(seq)
 		e.dupGap++
-		if e.dupGap >= 2 && now.Sub(e.sentAt) >= rto/2 {
+		if e.dupGap >= 2 && now.Sub(e.sentAt) >= resendGap {
 			w.resend = append(w.resend, seq)
 		}
 	}
 	slices.Sort(w.resend)
 	return w.resend
+}
+
+// takeSample запоминает оборот подтверждённого пакета. Пакеты, отправленные
+// больше одного раза, пропускаются: неизвестно, какой из передач отвечает
+// подтверждение (алгоритм Карна).
+func (w *Window) takeSample(e *entry, now time.Time) {
+	if e.tries != 1 || e.sentAt.IsZero() {
+		return
+	}
+	if rtt := now.Sub(e.sentAt); rtt > 0 && (!w.haveSample || e.seq >= w.sampleSeq) {
+		w.sample, w.haveSample, w.sampleSeq = rtt, true, e.seq
+	}
+}
+
+// TakeRTT отдаёт измеренный оборот и сбрасывает его: одно измерение
+// учитывается оценщиком ровно один раз.
+func (w *Window) TakeRTT() (time.Duration, bool) {
+	if !w.haveSample {
+		return 0, false
+	}
+	rtt := w.sample
+	w.sample, w.haveSample = 0, false
+	return rtt, true
 }
 
 // Expired возвращает seq с истёкшим таймаутом, по возрастанию — порядок

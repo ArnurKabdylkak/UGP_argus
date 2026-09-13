@@ -16,6 +16,13 @@ import (
 // трафиком. При переполнении кеш просто сбрасывается.
 const maxPeers = 4096
 
+// Размер буферов сокета. Системное умолчание — около 200 КБ, это примерно
+// 150 пакетов: окно, выданное вспышкой на скорости линии, переполняет его,
+// пока приёмник занят разбором и записью. Потерянный так пакет останавливает
+// поток до повтора, поэтому буфер берём с запасом. Ядро молча урежет значение
+// до net.core.rmem_max, и это нормально.
+const socketBuffer = 4 << 20
+
 // peerAddr — адрес источника с заранее посчитанным текстовым видом.
 // Прикладной слой строит по нему ключ сессии на каждый пакет, а
 // (*net.UDPAddr).String() — это форматирование и три аллокации на вызов.
@@ -41,10 +48,18 @@ type Link struct {
 	connected bool // сокет привязан к одному узлу (Dial)
 	buf       []byte
 	peers     map[netip.AddrPort]*peerAddr
+
+	// текущий срок ожидания чтения: переустанавливается, только когда истёк
+	// или когда просят подождать меньше, чем осталось
+	deadline time.Time
 }
 
 // newLink собирает канал поверх готового сокета.
 func newLink(conn *net.UDPConn, connected bool) *Link {
+	// ошибки не фатальны: без расширенных буферов канал работает, просто
+	// хуже переносит вспышки
+	_ = conn.SetReadBuffer(socketBuffer)
+	_ = conn.SetWriteBuffer(socketBuffer)
 	return &Link{
 		conn:      conn,
 		connected: connected,
@@ -126,14 +141,35 @@ func (l *Link) Send(payload []byte, to port.Addr) error {
 	return err
 }
 
+// armDeadline ставит срок ожидания чтения, пропуская системный вызов, если
+// действующий срок и так наступит не позже запрошенного. В потоке пакет за
+// пакетом это убирает по вызову с каждого принятого пакета: срок
+// переустанавливается раз в timeout, а не 150 тысяч раз в секунду.
+//
+// Действующий срок всегда не позже запрошенного, поэтому Recv может вернуть
+// таймаут раньше, чем просили, — для опроса это безопасно.
+func (l *Link) armDeadline(timeout time.Duration) error {
+	now := time.Now()
+	want := now.Add(timeout)
+	if l.deadline.After(now) && !l.deadline.After(want) {
+		return nil
+	}
+	if err := l.conn.SetReadDeadline(want); err != nil {
+		return err
+	}
+	l.deadline = want
+	return nil
+}
+
 func (l *Link) Recv(timeout time.Duration) (port.Datagram, error) {
-	if err := l.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+	if err := l.armDeadline(timeout); err != nil {
 		return port.Datagram{}, err
 	}
 	n, ap, err := l.conn.ReadFromUDPAddrPort(l.buf)
 	if err != nil {
 		var ne net.Error
 		if errors.As(err, &ne) && ne.Timeout() {
+			l.deadline = time.Time{} // срок истёк, следующий вызов поставит новый
 			return port.Datagram{}, port.ErrTimeout
 		}
 		if errors.Is(err, net.ErrClosed) {

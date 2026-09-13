@@ -12,6 +12,11 @@ import (
 	"github.com/argus/udpr/internal/port"
 )
 
+// writeBuffer — размер буфера записи. Умолчание bufio (4 КБ) означает запись
+// на диск каждые три пакета: приёмник однопоточный, и на время записи он не
+// читает сокет.
+const writeBuffer = 1 << 20
+
 var _ io.WriteCloser = (*bufferedFile)(nil)
 
 // Factory возвращает фабрику приёмников, пишущую потоки в каталог dir файлами
@@ -27,7 +32,7 @@ func Factory(dir string, notify func(port.SessionInfo, string)) port.SinkFactory
 		if notify != nil {
 			notify(info, name)
 		}
-		return &bufferedFile{Writer: bufio.NewWriter(f), file: f}, nil
+		return &bufferedFile{Writer: bufio.NewWriterSize(f, writeBuffer), file: f}, nil
 	}
 }
 

@@ -25,7 +25,8 @@ func cmdSelftest(args []string) error {
 	size := fs.Int("size", 256*1024, "размер тестового потока, байт")
 	mtu := fs.Int("mtu", domain.MaxPayload, "payload на пакет, байт")
 	window := fs.Int("window", 32, "размер окна в пакетах")
-	rto := fs.Duration("rto", 100*time.Millisecond, "таймаут повторной отправки")
+	rto := fs.Duration("rto", 100*time.Millisecond, "начальный таймаут повтора")
+	bitrate := fs.Float64("bitrate", 0, "предел скорости отправки, Мбит/с (0 — без предела)")
 	loss := fs.Float64("loss", 0, "имитация потерь канала, 0..1")
 	verbose := fs.Bool("v", false, "подробный лог")
 	if err := fs.Parse(args); err != nil {
@@ -65,6 +66,7 @@ func cmdSelftest(args []string) error {
 
 	scfg := usecase.DefaultSenderConfig()
 	scfg.MTU, scfg.Window, scfg.RTO = *mtu, *window, *rto
+	scfg.Bitrate = *bitrate * 1e6
 	scfg.Logger = newLogger(*verbose)
 	if err := scfg.Validate(); err != nil {
 		return err
@@ -95,7 +97,8 @@ func cmdSelftest(args []string) error {
 
 	got := sink.Bytes()
 	ok := sha256.Sum256(got) == sha256.Sum256(payload)
-	fmt.Fprintf(os.Stderr, "[send] %s, время %.2f c\n", txStats, elapsed)
+	fmt.Fprintf(os.Stderr, "[send] %s, время %.2f c, итоговый RTO %s\n",
+		txStats, elapsed, s.RTO().Round(time.Microsecond))
 	if n, reason := s.Guard().Stats(); n > 0 {
 		fmt.Fprintf(os.Stderr, "[send] ACK Guard отклонил %d пакетов (последний: %s)\n", n, reason)
 	}

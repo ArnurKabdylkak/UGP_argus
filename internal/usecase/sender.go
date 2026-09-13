@@ -33,6 +33,14 @@ type SenderConfig struct {
 	AckBurst   float64       // допустимый всплеск ACK
 	Session    uint32        // 0 — сгенерировать случайно
 
+	// RTO задаёт начальный таймаут; дальше он выводится из измеренного
+	// оборота и удерживается в пределах MinRTO..MaxRTO.
+	MinRTO time.Duration
+	MaxRTO time.Duration
+
+	// Bitrate ограничивает скорость выдачи в канал, бит/с. 0 — без предела.
+	Bitrate float64
+
 	// Logger принимает диагностику. nil — молчать.
 	Logger *slog.Logger
 }
@@ -48,6 +56,8 @@ func DefaultSenderConfig() SenderConfig {
 		// плюс немедленные ACK на разрывы; 20k/с с запасом покрывает 10 Гбит/с
 		AckRate:  20000,
 		AckBurst: 1024,
+		MinRTO:   2 * time.Millisecond,
+		MaxRTO:   2 * time.Second,
 	}
 }
 
@@ -68,6 +78,12 @@ func (c SenderConfig) Validate() error {
 	case c.AckRate < 0 || c.AckBurst < 0:
 		return fmt.Errorf("ack-rate=%.0f и ack-burst=%.0f должны быть неотрицательны",
 			c.AckRate, c.AckBurst)
+	case c.MinRTO < 0 || c.MaxRTO < 0:
+		return fmt.Errorf("min-rto=%s и max-rto=%s должны быть неотрицательны", c.MinRTO, c.MaxRTO)
+	case c.MinRTO > 0 && c.MaxRTO > 0 && c.MinRTO > c.MaxRTO:
+		return fmt.Errorf("min-rto=%s больше max-rto=%s", c.MinRTO, c.MaxRTO)
+	case c.Bitrate < 0:
+		return fmt.Errorf("bitrate=%.0f отрицателен", c.Bitrate)
 	}
 	return nil
 }
@@ -92,6 +108,15 @@ func (c *SenderConfig) normalize() {
 	}
 	if c.AckBurst <= 0 {
 		c.AckBurst = 1024
+	}
+	if c.MinRTO <= 0 {
+		c.MinRTO = 2 * time.Millisecond
+	}
+	if c.MaxRTO <= 0 {
+		c.MaxRTO = 2 * time.Second
+	}
+	if c.MinRTO > c.MaxRTO {
+		c.MinRTO = c.MaxRTO
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
@@ -120,6 +145,8 @@ type Sender struct {
 	clock port.Clock
 	guard *domain.AckGuard
 	win   *domain.Window
+	rtt   *domain.RTTEstimator
+	pacer *domain.Pacer
 	stats SenderStats
 }
 
@@ -142,8 +169,14 @@ func NewSender(link port.Link, clock port.Clock, cfg SenderConfig) (*Sender, err
 		clock: clock,
 		guard: domain.NewAckGuard(cfg.Session, cfg.AckRate, cfg.AckBurst),
 		win:   domain.NewWindow(cfg.Window),
+		rtt:   domain.NewRTTEstimator(cfg.RTO, cfg.MinRTO, cfg.MaxRTO),
+		pacer: domain.NewPacer(cfg.Bitrate/8, 0),
 	}, nil
 }
+
+// RTO возвращает текущий таймаут повторной отправки — он выводится из
+// измеренного оборота и меняется по ходу передачи.
+func (s *Sender) RTO() time.Duration { return s.rtt.RTO() }
 
 // Session возвращает идентификатор сессии.
 func (s *Sender) Session() uint32 { return s.cfg.Session }
@@ -196,7 +229,14 @@ func (s *Sender) SendStream(ctx context.Context, r io.Reader) (SenderStats, erro
 		if err := ctx.Err(); err != nil {
 			return s.stats, err
 		}
+		// пауза, назначенная ограничителем скорости: ждём не дольше неё,
+		// иначе очередная порция уйдёт с опозданием
+		paceWait := time.Duration(0)
 		for !eof && s.win.CanQueue() {
+			if ok, wait := s.pacer.Allow(s.cfg.MTU, s.clock.Now()); !ok {
+				paceWait = wait
+				break
+			}
 			n, err := io.ReadFull(r, buf)
 			if n > 0 {
 				if err := s.queue(buf[:n]); err != nil {
@@ -211,7 +251,7 @@ func (s *Sender) SendStream(ctx context.Context, r io.Reader) (SenderStats, erro
 			break
 		}
 
-		dg, err := s.link.Recv(s.cfg.RTO / 4)
+		dg, err := s.link.Recv(s.pollTimeout(paceWait))
 		switch {
 		case err == nil:
 			s.applyDatagram(dg)
@@ -264,20 +304,45 @@ func (s *Sender) applyDatagram(dg port.Datagram) {
 		return
 	}
 	s.stats.Acks++
-	for _, seq := range s.win.Ack(ack.AckBase, ack.AckBitmap, now, s.cfg.RTO) {
+	for _, seq := range s.win.Ack(ack.AckBase, ack.AckBitmap, now, s.rtt.ResendGap()) {
 		s.emit(seq)
+	}
+	// измерение оборота снимается только с пакетов, отправленных однажды
+	if sample, ok := s.win.TakeRTT(); ok {
+		s.rtt.Sample(sample)
 	}
 }
 
 func (s *Sender) checkTimeouts() error {
 	now := s.clock.Now()
-	for _, seq := range s.win.Expired(now, s.cfg.RTO) {
+	expired := s.win.Expired(now, s.rtt.RTO())
+	if len(expired) == 0 {
+		return nil
+	}
+	// таймаут означает, что оценка оборота не подтвердилась: ждём дольше,
+	// прежде чем снова занимать канал повторами
+	s.rtt.BackOff()
+	for _, seq := range expired {
 		if s.win.Tries(seq) > s.cfg.MaxRetries {
 			return fmt.Errorf("%w: seq=%d исчерпал %d попыток", ErrDeliveryFailed, seq, s.win.Tries(seq))
 		}
 		s.emit(seq)
 	}
 	return nil
+}
+
+// pollTimeout — сколько ждать обратный канал перед следующей проверкой
+// таймаутов. Четверть текущего RTO даёт достаточную частоту проверок, но
+// ждать дольше паузы ограничителя скорости нельзя.
+func (s *Sender) pollTimeout(paceWait time.Duration) time.Duration {
+	wait := s.rtt.RTO() / 4
+	if wait < time.Millisecond/2 {
+		wait = time.Millisecond / 2
+	}
+	if paceWait > 0 && paceWait < wait {
+		wait = paceWait
+	}
+	return wait
 }
 
 // randomSession выдаёт идентификатор сессии. Младший бит выставлен, чтобы
